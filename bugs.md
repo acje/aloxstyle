@@ -1,12 +1,8 @@
 # Things That Are Bugs
 
-A bug violates a required outcome or constraint, leaves risk unmanaged,
-or adds validation without assurance. Requirements include buildability,
-functionality, resource and latency budgets, security, supported environments,
-presentation, accessibility, integration, and concurrency safety and progress.
+A bug violates a required outcome or constraint or leaves risk unmanaged.
 
-Classify by failure mechanism, not affected feature or introduction history.
-Categories may overlap.
+Categories may overlap to some degree.
 
 ## Under-implementation
 
