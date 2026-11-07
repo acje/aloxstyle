@@ -1,16 +1,38 @@
 # Things That Are Bugs
 
 A bug violates a required outcome or constraint, leaves risk unmanaged,
-or adds validation without assurance. Constraints include security and
-resource and latency budgets.
+or adds validation without assurance. Requirements include buildability,
+functionality, resource and latency budgets, security, supported environments,
+presentation, accessibility, integration, and concurrency safety and progress.
+
+Classify by failure mechanism, not affected feature or introduction history.
+Categories may overlap.
+
+## Under-implementation
+
+Omitting required behavior or guarantees.
 
 | Category | Failure |
 | --- | --- |
-| **Tautological logic (over-checking)** | Rechecking guaranteed conditions without additional assurance. |
 | **Blind execution (under-checking)** | Skipping required validation where failure is possible. |
-| **Logic under-implementation** | Omitting a required branch or outcome. |
-| **Logic over-permissiveness** | Allowing forbidden inputs, actions, states, or outcomes. |
 | **Fault abandonment** | Failing to recover, contain, escalate, or terminate appropriately after failure. |
-| **Incorrect logic** | Applying an incorrect condition, calculation, or decision rule. |
+
+## Over-permissiveness
+
+Allowing forbidden behavior, states, or resource consumption.
+
+| Category | Failure |
+| --- | --- |
 | **State inconsistency** | Leaving state contradictory, corrupted, or inconsistent across components. |
 | **Fault propagation** | Letting failure spread beyond its permitted scope. |
+
+## Incorrect Implementation
+
+Using invalid code or realizing requirements incorrectly.
+
+| Category | Failure |
+| --- | --- |
+| **Over-checking** | Rechecking guaranteed conditions without additional assurance. |
+| **Incorrect logic** | Applying an incorrect condition, calculation, or decision rule. |
+| **Invalid code structure** | Violating syntax, typing, or build constraints. |
+| **Incorrect coordination** | Using incorrect ordering, synchronization, or communication between operations or components. |
