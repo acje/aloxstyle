@@ -25,8 +25,9 @@ and security constraints, prioritize:
 
 ## Design deep modules
 
-- Give each format, configuration rule, and state transition one owner. Expose
-  meaningful operations over validated values.
+- Give each format, configuration rule, and state transition one owner. Define
+  related constants with that owner, derive dependent values, and expose
+  operations over validated values.
 - Prefer unique ownership and borrowing; justify cloning and `Rc`/`Arc` against
   latency and lifecycle budgets. Accept borrowed views such as `&str` and `&[T]`
   when container ownership is irrelevant; preserve validated domain types.
@@ -47,8 +48,14 @@ and security constraints, prioritize:
 
 Use enums, newtypes, private fields, and state machines to exclude real invalid
 states. Separate untrusted input representations from validated domain values.
+Construct validated domain values through checked constructors or `TryFrom`;
+reserve `From` for infallible, lossless conversions.
 Represent independent flags as booleans and genuine optionality as `Option`.
 Choose integer types that fit the domain and Rust APIs.
+
+Use `const fn` for compile-time callers and const initializers or blocks to
+require compile-time evaluation. Preserve public const-callability across
+compatible releases.
 
 All construction and mutation paths for validated values preserve domain
 invariants, including parsing, trait implementations, and code inside the
@@ -81,15 +88,20 @@ Use guards for genuine preconditions and early short-circuits. Use `?`,
   caught panic requires a demonstrated recovery contract.
 - Deny production `unwrap()`. Permit `expect()` only for a construction-proven
   invariant with a justified per-site lint expectation.
-- Encode structural facts in types or compile-time assertions first. Keep input
-  validation and correctness checks active in release builds. Reserve
-  `debug_assert!` for removable diagnostics and measure hot-path assertion costs.
+- Where overflow is not excluded by construction, use checked arithmetic.
+  Saturating or wrapping behavior must be part of the domain contract.
+- Enforce structural invariants, including capacity and layout relationships,
+  through types or const assertions. Keep input validation and correctness checks
+  active in release builds; reserve `debug_assert!` for diagnostics. Keep hot-path
+  assertions within execution budgets.
 
 ## Bound execution
 
 Use explicit scheduling without an async runtime. The application owns
 scheduling, fairness, timer progress, and shutdown.
 
+- Use `Instant` for deadlines and elapsed time, `Duration` for intervals, and
+  `SystemTime` for wall-clock timestamps.
 - Work in bounded increments between reachable timer and shutdown checks.
   Apply the same discipline to synchronous helpers and drain loops.
 - Prefer direct loops when they expose errors and work budgets more clearly.
@@ -121,6 +133,14 @@ serving; report startup failures through `Result`. Do not run code before
 `main()`. Reserve fixed connection, buffer, and cache capacity at startup when
 required by the service contract. Account separately for future socket creation
 and kernel resource exhaustion.
+
+- Use `const` for fixed values and immutable `static` for shared program-lifetime
+  storage. Runtime copies and drops of const values remain subject to resource
+  budgets.
+- Where allocation failure must return an error, use fallible reservation such
+  as `try_reserve` and prevent implicit growth beyond reserved capacity.
+- Keep `Drop` bounded and nonblocking. Expose fallible shutdown and flush
+  operations as explicit methods returning `Result`.
 
 For each allocation or deallocation restriction, specify:
 
