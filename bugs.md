@@ -10,6 +10,7 @@ Omitting required behavior or guarantees.
 
 | Category | Failure |
 | --- | --- |
+| **Incomplete behavior** | Not providing the full behavior as intended |
 | **Blind execution (under-checking)** | Skipping required validation where failure is possible. |
 | **Fault abandonment** | Failing to recover, contain, escalate, or terminate appropriately after failure. |
 
@@ -19,6 +20,7 @@ Allowing forbidden behavior, states, or resource consumption.
 
 | Category | Failure |
 | --- | --- |
+| **Excessive behavior** | Providing behavior beyond what is intended |
 | **State inconsistency** | Leaving state contradictory, corrupted, or inconsistent across components. |
 | **Fault propagation** | Letting failure spread beyond its permitted scope. |
 
