@@ -11,7 +11,7 @@ Omitting required behavior or guarantees.
 | Category | Failure |
 | --- | --- |
 | **Incomplete behavior** | Not providing the full behavior as intended |
-| **Blind execution (under-checking)** | Skipping required validation where failure is possible. |
+| **Under checking** | Skipping required validation where failure is possible. |
 | **Fault abandonment** | Failing to recover, contain, escalate, or terminate appropriately after failure. |
 
 ## Over-permissiveness
