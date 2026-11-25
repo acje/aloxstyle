@@ -42,11 +42,14 @@ tests, where a panicking assertion is the expected failure mode.
 
 ### Lint levels
 
-Three lints are `deny`, matching the style's wording: `unused_must_use` in
-`[workspace.lints.rust]`, plus `unwrap_used` and `expect_used` in
-`[workspace.lints.clippy]`. Every other lint is `warn`. A repository that adopts
-the table with existing violations will fail to build until it fixes them or
-silences each site deliberately.
+Eight lints are `deny`. `unused_must_use` and `unsafe_op_in_unsafe_fn` in
+`[workspace.lints.rust]`, plus `unwrap_used`, `expect_used`, and
+`allow_attributes_without_reason` in `[workspace.lints.clippy]`, match the
+style's wording. The production panic markers `dbg_macro`, `todo`, and
+`unimplemented` extend the same fail-stop rule to debug output and unfinished
+paths. Every other lint is `warn`. A repository that adopts the table with
+existing violations will fail to build until it fixes them or silences each site
+deliberately.
 
 Justified `expect()` calls are marked with a per-site expectation carrying a
 reason, for example `#[expect(clippy::expect_used, reason = "construction
@@ -59,16 +62,23 @@ keeps `#[allow]` exceptions reasoned as well.
   on integers, including test code and values whose range is fixed by
   construction, so it does not separate unguarded overflow from arithmetic the
   style accepts.
+- The `pedantic` group is not enabled wholesale. Five of its lints are adopted as
+  `warn`: `match_wild_err_arm`, `option_option`, `unchecked_time_subtraction`,
+  `manual_instant_elapsed`, and `large_types_passed_by_value`. The remaining
+  pedantic lints are omitted because they fire on constructs the style permits or
+  are too noisy to serve as the de-facto implementation.
 - `as_conversions`, `wildcard_enum_match_arm`, `allow_attributes`, and the
-  `pedantic`, `nursery`, `cargo`, and `restriction` groups are not enabled: they
-  fire on constructs the style permits, or they are too noisy to serve as the
-  de-facto implementation.
+  `nursery`, `cargo`, and `restriction` groups are not enabled: they fire on
+  constructs the style permits, or they are too noisy to serve as the de-facto
+  implementation.
 - `disallowed-methods` and `disallowed-types` are not set in `clippy.toml`:
   library-specific policy belongs to the project, not to the style.
 - The plain line and block comment prohibition is not lint-enforceable; it is
   served by a separate `comment-free` tool.
 - The unsafe code policy is pending, so neither file sets `unsafe_code`.
-  `undocumented_unsafe_blocks` is `warn` in the meantime.
+  `undocumented_unsafe_blocks` is `warn` in the meantime, and its `// SAFETY:`
+  marker is the one comment form the style permits (see [Explain through
+  structure and contracts](aloxstyle.md#explain-through-structure-and-contracts)).
 
 ## License
 

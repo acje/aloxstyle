@@ -186,6 +186,13 @@ project's restrictions on unsafe code.
 Plain line and block comments are prohibited, including safety notes, TODOs,
 lint justifications, and commented-out code.
 
+One exception is a contract marker rather than commentary: a `// SAFETY:` line
+immediately preceding an `unsafe` block or unsafe operation, stating why the
+operation is sound. Keep the line to the soundness argument; put extended
+rationale in the design decision, commit message, or issue. Where the block also
+needs a lint exemption, keep the two distinct: soundness in the marker, the
+exemption's scope in the `reason`.
+
 ## Choose dependencies and tools deliberately
 
 Compare dependencies with equivalent in-house code on maintenance cost,
