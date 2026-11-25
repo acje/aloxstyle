@@ -14,6 +14,8 @@ Copy-in (Cargo has no remote include; neither file carries comments — the rati
 | `cargo-lints.toml` | Complete table: `[workspace.lints.rust]` + `[workspace.lints.clippy]`. |
 | `clippy.toml` | Test exemptions for `unwrap` and `expect`. |
 
+Run the canonical gate: `cargo clippy --all-targets --all-features -- -D warnings`.
+
 ## License
 
 MIT or Apache-2.0, at your option.
