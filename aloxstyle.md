@@ -10,7 +10,8 @@ Define observable success, acceptable degradation, and recovery under normal loa
 overload, and dependency failure. Align API contracts and budgets with these
 outcomes. Distinguish enforced invariants from environmental assumptions in
 service contracts; define behavior when assumptions fail. Within correctness
-and security constraints, prioritize:
+and security constraints, consider the [security qualities and threat
+model](https://acje.github.io/systems/cisq-maturity/), and prioritize:
 
 1. **Maintainability.** Favor simple designs and small, reversible, deployable
    changes.
@@ -193,3 +194,5 @@ project dependency restrictions.
 
 Use the project's formatter and lint configuration. Give lint exceptions
 specific reasons and preserve coherent logic when satisfying size limits.
+Review build-time and proc-macro dependency surfaces through the
+[rust-dep-intake skill](https://github.com/acje/.config/blob/main/opencode/skills/rust-dep-intake/SKILL.md).
