@@ -223,3 +223,75 @@ fn cli_unparseable_source_exits_three() -> Result<(), Box<dyn std::error::Error>
     );
     Ok(())
 }
+
+#[test]
+fn cli_flags_underflow_without_allowlist() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "fn f(a: u32, b: u32) -> u32 {\n    a - b\n}\n")?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert_eq!(output.status.code(), Some(1), "expected exit 1, got {output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("underflow"),
+        "expected underflow finding, got {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_allow_config_suppresses_underflow() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "fn f(a: u32, b: u32) -> u32 {\n    a - b\n}\n")?;
+    let dir = file.parent().expect("has parent");
+    let allow = dir.join("allow.toml");
+    fs::write(
+        &allow,
+        "[[allow]]\npath = \"fx.rs\"\nrule = \"underflow\"\nsnippet = \"a - b\"\nreason = \"test site is sized so b never exceeds a\"\n",
+    )?;
+    let output = Command::new(bin_path())
+        .arg(&file)
+        .arg("--allow-config")
+        .arg(&allow)
+        .output()?;
+    assert!(output.status.success(), "expected exit 0, got {output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.is_empty(), "expected no findings, got {stdout}");
+    Ok(())
+}
+
+#[test]
+fn cli_allow_config_missing_reason_exits_two() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "fn f(a: u32, b: u32) -> u32 {\n    a - b\n}\n")?;
+    let dir = file.parent().expect("has parent");
+    let allow = dir.join("allow.toml");
+    fs::write(
+        &allow,
+        "[[allow]]\npath = \"fx.rs\"\nrule = \"underflow\"\nsnippet = \"a - b\"\n",
+    )?;
+    let output = Command::new(bin_path())
+        .arg(&file)
+        .arg("--allow-config")
+        .arg(&allow)
+        .output()?;
+    assert_eq!(output.status.code(), Some(2), "expected exit 2, got {output:?}");
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("no `reason`"),
+        "expected missing-reason error, got {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_allow_config_missing_file_exits_two() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "pub fn fx() {}\n")?;
+    let missing = file
+        .parent()
+        .expect("has parent")
+        .join("does-not-exist.toml");
+    let output = Command::new(bin_path())
+        .arg(&file)
+        .arg("--allow-config")
+        .arg(&missing)
+        .output()?;
+    assert_eq!(output.status.code(), Some(2), "expected exit 2, got {output:?}");
+    Ok(())
+}

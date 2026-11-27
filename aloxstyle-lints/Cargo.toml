@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 rustc_lexer = "0.1"
-syn = { version = "2", default-features = false, features = ["full", "visit", "parsing"] }
+syn = { version = "2", default-features = false, features = ["full", "visit", "parsing", "printing"] }
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 
 [lints.rust]

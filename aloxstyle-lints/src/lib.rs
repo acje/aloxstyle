@@ -6,10 +6,11 @@
 //! parseable is reported as [`CheckOutcome::Indeterminate`] (a fail-closed
 //! gate, never a clean pass).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rustc_lexer::TokenKind;
+use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 /// Severity of a [`Finding`]. Every `AloxStyle` rule is a build-failing gate, so
@@ -92,19 +93,29 @@ pub trait Rule {
 /// Runs a rule set over a single source file.
 pub struct Linter {
     path: PathBuf,
+    allowlist: Allowlist,
 }
 
 impl Linter {
-    /// Creates a linter bound to `path`, the location findings are attributed to.
+    /// Creates a linter bound to `path`, the location findings are attributed to,
+    /// with an empty allowlist.
     #[must_use]
     pub const fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self::with_allowlist(path, Allowlist::empty())
+    }
+
+    /// Creates a linter bound to `path` that suppresses findings matched by
+    /// `allowlist`.
+    #[must_use]
+    pub const fn with_allowlist(path: PathBuf, allowlist: Allowlist) -> Self {
+        Self { path, allowlist }
     }
 
     /// Runs every registered rule over `source`, returning the outcome.
     ///
     /// The file is parsed once at this boundary. If parsing fails the outcome is
-    /// [`CheckOutcome::Indeterminate`]; otherwise every rule runs on the parse.
+    /// [`CheckOutcome::Indeterminate`]; otherwise every rule runs on the parse
+    /// and the allowlist suppresses any matching finding.
     #[must_use]
     pub fn check(&self, source: &str) -> CheckOutcome {
         let Ok(ast) = syn::parse_file(source) else {
@@ -114,16 +125,18 @@ impl Linter {
         for rule in rules() {
             rule.check(source, &ast, &self.path, &mut findings);
         }
+        let findings = self.allowlist.apply(findings, source);
         CheckOutcome::Findings(findings)
     }
 }
 
 fn rules() -> &'static [&'static dyn Rule] {
-    &[&NO_NON_SAFETY_COMMENT, &UNSAFE_NEEDS_SAFETY_MARKER]
+    &[&NO_NON_SAFETY_COMMENT, &UNSAFE_NEEDS_SAFETY_MARKER, &UNDERFLOW]
 }
 
 const NO_NON_SAFETY_COMMENT: NoNonSafetyComment = NoNonSafetyComment;
 const UNSAFE_NEEDS_SAFETY_MARKER: UnsafeNeedsSafetyMarker = UnsafeNeedsSafetyMarker;
+const UNDERFLOW: Underflow = Underflow;
 
 /// The rule that flags plain line and block comments.
 ///
@@ -466,6 +479,494 @@ fn unsafe_finding(path: &Path, source: &str, offset: usize, kind: &str) -> Findi
     }
 }
 
+/// A reason-bearing allowlist of suppressed findings.
+///
+/// An entry suppresses a finding when its `path` and `rule` match and either
+/// the finding's line equals `line`, or (when `line` is absent) the finding's
+/// source line contains `snippet`. The `reason` is mandatory: `AloxStyle` gives
+/// every lint exemption a specific rationale. The reader accepts a restricted
+/// TOML subset (a `[[allow]]` array of tables) so the file is a real
+/// `.aloxstyle-lints.toml` without pulling a TOML dependency.
+#[derive(Debug, Clone, Default)]
+pub struct Allowlist {
+    entries: Vec<AllowEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct AllowEntry {
+    path: String,
+    rule: String,
+    line: Option<usize>,
+    snippet: Option<String>,
+    reason: String,
+}
+
+impl Allowlist {
+    /// Returns an empty allowlist.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    /// Parses an allowlist file body.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the offending line when the body is not the
+    /// expected shape or an entry is missing its mandatory `reason`.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut entries: Vec<AllowEntry> = Vec::new();
+        let mut current: Option<AllowEntry> = None;
+        for (idx, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line == "[[allow]]" {
+                if let Some(previous) = current.take() {
+                    entries.push(previous);
+                }
+                current = Some(AllowEntry {
+                    path: String::new(),
+                    rule: String::new(),
+                    line: None,
+                    snippet: None,
+                    reason: String::new(),
+                });
+                continue;
+            }
+            let entry = current.as_mut().ok_or_else(|| {
+                format!("line {}: key outside a [[allow]] table", idx + 1)
+            })?;
+            let (key, value) =
+                parse_config_kv(line).ok_or_else(|| format!("line {}: expected `key = value`", idx + 1))?;
+            match key.as_str() {
+                "path" => entry.path = value,
+                "rule" => entry.rule = value,
+                "line" => {
+                    entry.line = Some(value.parse().map_err(|_| {
+                        format!("line {}: `line` must be an integer", idx + 1)
+                    })?);
+                }
+                "snippet" => entry.snippet = Some(value),
+                "reason" => entry.reason = value,
+                _ => return Err(format!("line {}: unknown key `{key}`", idx + 1)),
+            }
+        }
+        if let Some(last) = current.take() {
+            entries.push(last);
+        }
+        for entry in &entries {
+            if entry.reason.trim().is_empty() {
+                return Err(format!(
+                    "allowlist entry for {}:{} has no `reason`",
+                    entry.path, entry.rule
+                ));
+            }
+        }
+        Ok(Allowlist { entries })
+    }
+
+    /// Applies the allowlist to `findings`, dropping any that match an entry.
+    #[must_use]
+    pub fn apply(&self, findings: Vec<Finding>, source: &str) -> Vec<Finding> {
+        findings
+            .into_iter()
+            .filter(|finding| !self.is_suppressed(finding, source))
+            .collect()
+    }
+
+    fn is_suppressed(&self, finding: &Finding, source: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.suppresses(finding, source))
+    }
+}
+
+impl AllowEntry {
+    /// Returns true when this entry suppresses `finding` within `source`.
+    ///
+    /// A `line` entry matches the finding's 1-based line exactly. A `snippet`
+    /// entry matches when the finding's source line contains the snippet as a
+    /// literal substring, or when the snippet matches after whitespace is
+    /// collapsed on both sides — so a snippet copied from a finding message
+    /// (which strips whitespace, e.g. `b"GET / HTT"` shows as `b"GET/HTT"`)
+    /// still suppresses.
+    fn suppresses(&self, finding: &Finding, source: &str) -> bool {
+        if self.rule != finding.rule_id.as_str() || !path_suffix_match(&finding.path, &self.path) {
+            return false;
+        }
+        if let Some(line) = self.line {
+            return line == finding.line;
+        }
+        if let Some(snippet) = &self.snippet {
+            if snippet.is_empty() {
+                return false;
+            }
+            let line_text = source.lines().nth(finding.line.saturating_sub(1));
+            let needle = snippet.split_whitespace().collect::<String>();
+            return line_text.is_some_and(|line_text| {
+                line_text.contains(snippet.as_str())
+                    || line_text.split_whitespace().collect::<String>().contains(&needle)
+            });
+        }
+        false
+    }
+}
+
+fn path_suffix_match(path: &Path, suffix: &str) -> bool {
+    let path_str = path.to_string_lossy();
+    let suffix = suffix.trim_start_matches("./");
+    path_str == suffix
+        || path_str
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('/') || prefix.is_empty())
+}
+
+fn parse_config_kv(line: &str) -> Option<(String, String)> {
+    let (key, rest) = line.split_once('=')?;
+    let key = key.trim().to_string();
+    let value = rest.trim();
+    let value = if value.starts_with('"') {
+        value
+            .strip_prefix('"')?
+            .strip_suffix('"')?
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        value.to_string()
+    };
+    Some((key, value))
+}
+
+/// The rule that flags integer subtractions and decrements whose subtrahend may
+/// exceed the minuend, unless the site is constant, a time/float operation, a
+/// guarded or counter decrement, or allowlisted.
+///
+/// Discovery walks the parsed [`syn::File`] for `Expr::Binary` with `BinOp::Sub`
+/// (`a - b`) and `BinOp::SubAssign` (`a -= b`). A site is
+/// skipped when both operands are constant-foldable (a literal or a
+/// `SCREAMING_SNAKE` const path / `.len()` on a const), when either operand is a
+/// float or a time type (`Instant`/`Duration`/`SystemTime`), when it is a
+/// length-counter decrement by one, when it is guarded by a `while x > 0` loop,
+/// an immediately-preceding `if subtrahend >= minuend { return }`/`assert!`, an
+/// empty-queue `if length == 0 { return }`, or when the result wraps under a
+/// `& MASK`. Otherwise it is flagged: conservative, so the author hardens or
+/// allowlists.
+pub struct Underflow;
+
+impl Rule for Underflow {
+    fn check(&self, source: &str, ast: &syn::File, path: &Path, findings: &mut Vec<Finding>) {
+        let line_map = LineMap::new(source);
+        let mut visitor = UnderflowVisitor {
+            source,
+            path,
+            findings,
+            line_map: &line_map,
+            guards: Vec::new(),
+            loop_active: Vec::new(),
+            masked: HashSet::new(),
+            in_const: false,
+        };
+        visitor.visit_file(ast);
+    }
+}
+
+enum Guard {
+    Bounded { minuend: String, subtrahend: String },
+    NonEmpty { expr: String },
+}
+
+struct UnderflowVisitor<'a> {
+    source: &'a str,
+    path: &'a Path,
+    findings: &'a mut Vec<Finding>,
+    line_map: &'a LineMap,
+    guards: Vec<Guard>,
+    loop_active: Vec<String>,
+    masked: HashSet<usize>,
+    in_const: bool,
+}
+
+impl<'a> Visit<'a> for UnderflowVisitor<'a> {
+    fn visit_expr_binary(&mut self, node: &'a syn::ExprBinary) {
+        match node.op {
+            syn::BinOp::Sub(_) => {
+                if self.should_skip(&node.left, &node.right, false) {
+                    return;
+                }
+                self.push_underflow(&node.left, &node.right, false);
+            }
+            syn::BinOp::SubAssign(_) => {
+                if self.should_skip(&node.left, &node.right, true) {
+                    return;
+                }
+                self.push_underflow(&node.left, &node.right, true);
+            }
+            syn::BinOp::BitAnd(_) => {
+                for side in [&node.left, &node.right] {
+                    if let syn::Expr::Binary(b) = strip_ref_parens(side)
+                        && matches!(b.op, syn::BinOp::Sub(_))
+                    {
+                        let offset = self.offset_of(b.span());
+                        self.masked.insert(offset);
+                    }
+                }
+            }
+            _ => {}
+        }
+        syn::visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_expr_while(&mut self, node: &'a syn::ExprWhile) {
+        if let Some(counter) = self.loop_counter(&node.cond) {
+            self.loop_active.push(counter);
+        }
+        syn::visit::visit_expr_while(self, node);
+        self.loop_active.pop();
+    }
+
+    fn visit_block(&mut self, node: &'a syn::Block) {
+        let depth = self.guards.len();
+        for stmt in &node.stmts {
+            self.visit_stmt(stmt);
+            self.guards.extend(self.guards_of_stmt(stmt));
+        }
+        self.guards.truncate(depth);
+    }
+
+    fn visit_item_const(&mut self, node: &'a syn::ItemConst) {
+        let was = std::mem::replace(&mut self.in_const, true);
+        syn::visit::visit_item_const(self, node);
+        self.in_const = was;
+    }
+
+    fn visit_expr_const(&mut self, node: &'a syn::ExprConst) {
+        let was = std::mem::replace(&mut self.in_const, true);
+        syn::visit::visit_expr_const(self, node);
+        self.in_const = was;
+    }
+}
+
+impl<'a> UnderflowVisitor<'a> {
+    fn should_skip(&self, lhs: &syn::Expr, rhs: &syn::Expr, is_assign: bool) -> bool {
+        if self.in_const {
+            return true;
+        }
+        if self.masked.contains(&self.offset_of(lhs.span())) {
+            return true;
+        }
+        if is_float(lhs) || is_float(rhs) {
+            return true;
+        }
+        if self.is_const_ish(lhs) && self.is_const_ish(rhs) {
+            return true;
+        }
+        if is_assign && self.is_counter_decrement(lhs, rhs) {
+            return true;
+        }
+        self.is_guarded(lhs, rhs)
+    }
+
+    fn is_counter_decrement(&self, lhs: &syn::Expr, rhs: &syn::Expr) -> bool {
+        if !is_const_one(rhs) {
+            return false;
+        }
+        self.loop_active.contains(&self.expr_key(lhs))
+    }
+
+    /// Returns true when a subtraction is provably bounded by a preceding guard.
+    ///
+    /// A `Guard::Bounded` proves `minuend >= subtrahend` directly. A
+    /// `Guard::NonEmpty` (`if expr == 0 { return }`) proves only `expr != 0`;
+    /// that bounds just `expr - 1` (const-one subtrahend) on the guarded
+    /// expression itself, never a sibling field's subtraction.
+    fn is_guarded(&self, lhs: &syn::Expr, rhs: &syn::Expr) -> bool {
+        let min_key = self.expr_key(lhs);
+        let sub_key = self.expr_key(rhs);
+        if self.guards.iter().any(|g| {
+            matches!(g, Guard::Bounded { minuend, subtrahend }
+                if *minuend == min_key && *subtrahend == sub_key)
+        }) {
+            return true;
+        }
+        is_const_one(rhs)
+            && self
+                .guards
+                .iter()
+                .any(|g| matches!(g, Guard::NonEmpty { expr } if *expr == min_key))
+    }
+
+    fn push_underflow(&mut self, lhs: &syn::Expr, rhs: &syn::Expr, is_assign: bool) {
+        let offset = self.offset_of(lhs.span());
+        let op = if is_assign { "-=" } else { "-" };
+        let message = format!(
+            "subtraction `{} {op} {}`: potential underflow/overflow-panic hazard; use checked_sub/saturating_sub or add a proven bound",
+            self.expr_key(lhs),
+            self.expr_key(rhs),
+        );
+        self.findings.push(Finding {
+            severity: Severity::Error,
+            rule_id: RuleId::Underflow,
+            path: self.path.to_path_buf(),
+            line: byte_line(self.source, offset),
+            column: byte_column(self.source, offset),
+            message,
+        });
+    }
+
+    fn offset_of(&self, span: proc_macro2::Span) -> usize {
+        let lc = span.start();
+        self.line_map.byte_offset(self.source, lc.line, lc.column)
+    }
+
+    fn end_offset_of(&self, span: proc_macro2::Span) -> usize {
+        let lc = span.end();
+        self.line_map.byte_offset(self.source, lc.line, lc.column)
+    }
+
+    fn expr_key(&self, expr: &syn::Expr) -> String {
+        let start = self.offset_of(expr.span());
+        let end = self.end_offset_of(expr.span());
+        let text = &self.source[start..end.min(self.source.len())];
+        text.split_whitespace().collect()
+    }
+
+    fn is_const_ish(&self, expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Lit(l) => matches!(&l.lit, syn::Lit::Int(_)),
+            syn::Expr::Unary(u) => self.is_const_ish(&u.expr),
+            syn::Expr::Binary(b) => self.is_const_ish(&b.left) && self.is_const_ish(&b.right),
+            syn::Expr::Cast(c) => self.is_const_ish(&c.expr),
+            syn::Expr::Paren(p) => self.is_const_ish(&p.expr),
+            syn::Expr::Group(g) => self.is_const_ish(&g.expr),
+            _ => false,
+        }
+    }
+
+    fn loop_counter(&self, cond: &syn::Expr) -> Option<String> {
+        if let syn::Expr::Binary(b) = cond
+            && matches!(b.op, syn::BinOp::Gt(_))
+            && is_zero(&b.right)
+        {
+            return Some(self.expr_key(&b.left));
+        }
+        None
+    }
+
+    fn guards_of_stmt(&self, stmt: &syn::Stmt) -> Vec<Guard> {
+        let expr = match stmt {
+            syn::Stmt::Expr(e, _) => e,
+            syn::Stmt::Macro(m) => {
+                return if m.mac.path.is_ident("assert") {
+                    self.assert_guard(&m.mac).into_iter().collect()
+                } else {
+                    Vec::new()
+                };
+            }
+            _ => return Vec::new(),
+        };
+        match expr {
+            syn::Expr::If(ifex) => {
+                let then_block = &ifex.then_branch;
+                if !ends_in_control_flow(then_block) {
+                    return Vec::new();
+                }
+                self.collect_return_guards(&ifex.cond)
+            }
+            syn::Expr::Macro(mac) if mac.mac.path.is_ident("assert") => {
+                self.assert_guard(&mac.mac).into_iter().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn collect_return_guards(&self, cond: &syn::Expr) -> Vec<Guard> {
+        if let syn::Expr::Binary(b) = cond {
+            match b.op {
+                syn::BinOp::Or(_) => {
+                    let mut guards = self.collect_return_guards(&b.left);
+                    guards.extend(self.collect_return_guards(&b.right));
+                    return guards;
+                }
+                syn::BinOp::Ge(_) => {
+                    return vec![Guard::Bounded {
+                        minuend: self.expr_key(&b.right),
+                        subtrahend: self.expr_key(&b.left),
+                    }];
+                }
+                syn::BinOp::Eq(_) => {
+                    if is_zero(&b.right) {
+                        return vec![Guard::NonEmpty { expr: self.expr_key(&b.left) }];
+                    }
+                    return Vec::new();
+                }
+                _ => return Vec::new(),
+            }
+        }
+        Vec::new()
+    }
+
+    fn assert_guard(&self, mac: &syn::Macro) -> Option<Guard> {
+        let tokens = mac.tokens.clone();
+        let parsed = syn::parse2::<syn::Expr>(tokens).ok()?;
+        let expr = strip_parens(parsed);
+        if let syn::Expr::Binary(b) = expr
+            && matches!(b.op, syn::BinOp::Le(_))
+        {
+            return Some(Guard::Bounded {
+                minuend: self.expr_key(&b.right),
+                subtrahend: self.expr_key(&b.left),
+            });
+        }
+        None
+    }
+}
+
+fn ends_in_control_flow(block: &syn::Block) -> bool {
+    let Some(stmt) = block.stmts.last() else {
+        return false;
+    };
+    let syn::Stmt::Expr(expr, _) = stmt else {
+        return false;
+    };
+    matches!(expr, syn::Expr::Return(_) | syn::Expr::Break(_) | syn::Expr::Continue(_))
+}
+
+const fn is_float(expr: &syn::Expr) -> bool {
+    matches!(expr, syn::Expr::Lit(l) if matches!(&l.lit, syn::Lit::Float(_)))
+}
+
+fn is_const_one(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Lit(l) => matches!(&l.lit, syn::Lit::Int(i) if i.base10_digits() == "1"),
+        _ => false,
+    }
+}
+
+fn is_zero(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Lit(l) => matches!(&l.lit, syn::Lit::Int(i) if i.base10_digits() == "0"),
+        _ => false,
+    }
+}
+
+fn strip_parens(expr: syn::Expr) -> syn::Expr {
+    match expr {
+        syn::Expr::Paren(p) => strip_parens(*p.expr),
+        syn::Expr::Group(g) => strip_parens(*g.expr),
+        other => other,
+    }
+}
+
+fn strip_ref_parens(expr: &syn::Expr) -> &syn::Expr {
+    match expr {
+        syn::Expr::Paren(p) => strip_ref_parens(&p.expr),
+        syn::Expr::Group(g) => strip_ref_parens(&g.expr),
+        other => other,
+    }
+}
+
 fn plain_comment_finding(path: &Path, source: &str, start: usize, kind: &str) -> Finding {
     Finding {
         severity: Severity::Error,
@@ -490,7 +991,7 @@ fn byte_column(source: &str, byte_offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckOutcome, Finding, Linter, RuleId};
+    use super::{Allowlist, CheckOutcome, Finding, Linter, RuleId};
     use std::path::PathBuf;
 
     fn findings(linter: &Linter, source: &str) -> Vec<Finding> {
@@ -778,6 +1279,195 @@ mod tests {
             "src/lib.rs:3:7: underflow",
             "finding display"
         );
+    }
+
+    #[test]
+    fn flags_unbounded_runtime_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(a: u32, b: u32) -> u32 {\n    a - b\n}\n";
+        let findings = findings(&linter, source);
+        assert_eq!(findings.len(), 1, "one unbounded subtraction");
+        assert_eq!(findings[0].rule_id, RuleId::Underflow, "underflow rule id");
+    }
+
+    #[test]
+    fn flags_assignop_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(a: u32, b: u32) {\n    let mut a = a;\n    a -= b;\n}\n";
+        let findings = findings(&linter, source);
+        assert_eq!(findings.len(), 1, "one unbounded `-=`");
+        assert_eq!(findings[0].rule_id, RuleId::Underflow, "underflow rule id");
+    }
+
+    #[test]
+    fn skips_literal_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f() -> u32 {\n    4 - 1\n}\n";
+        assert!(findings(&linter, source).is_empty(), "literal - literal");
+    }
+
+    #[test]
+    fn flags_const_path_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "const QUEUE: usize = 16;\nfn f() -> usize {\n    QUEUE - 1\n}\n";
+        assert_eq!(findings(&linter, source).len(), 1, "const-path is not a const proxy");
+    }
+
+    #[test]
+    fn flags_method_len_const_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "const R: &[u8] = b\"foo\";\nfn f() -> usize {\n    R.len() - 1\n}\n";
+        assert_eq!(findings(&linter, source).len(), 1, "`.len()` is not a const proxy");
+    }
+
+    #[test]
+    fn skips_const_item_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "const X: u32 = 4 - 1;\n";
+        assert!(findings(&linter, source).is_empty(), "const item value is const");
+    }
+
+    #[test]
+    fn skips_const_block_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "const X: u32 = { 4 - 1 };\n";
+        assert!(findings(&linter, source).is_empty(), "const block is const");
+    }
+
+    #[test]
+    fn flags_const_fn_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "const fn f(a: u32) -> u32 {\n    a - 1\n}\n";
+        assert_eq!(findings(&linter, source).len(), 1, "const fn is runtime-callable; a - 1 can underflow");
+    }
+
+    #[test]
+    fn skips_guarded_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(a: u32, b: u32) -> u32 {\n    if b >= a {\n        return 0;\n    }\n    a - b\n}\n";
+        assert!(findings(&linter, source).is_empty(), "guarded by `if b >= a`");
+    }
+
+    #[test]
+    fn skips_assert_guard_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(a: u32, b: u32) -> u32 {\n    assert!(b <= a);\n    a - b\n}\n";
+        assert!(findings(&linter, source).is_empty(), "guarded by assert!");
+    }
+
+    #[test]
+    fn flags_unproved_counter_decrement() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "struct S { len: u32 }\nimpl S {\n    fn dec(&mut self) {\n        self.len -= 1;\n    }\n}\n";
+        assert_eq!(findings(&linter, source).len(), 1, "counter name is not a proof");
+    }
+
+    #[test]
+    fn flags_unproved_local_decrement() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(mut count: u32) {\n    count -= 1;\n}\n";
+        assert_eq!(findings(&linter, source).len(), 1, "local -= 1 needs a proof");
+    }
+
+    #[test]
+    fn skips_while_index_decrement() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(mut index: u32) {\n    while index > 0 {\n        index -= 1;\n    }\n}\n";
+        assert!(findings(&linter, source).is_empty(), "while index > 0 decrement");
+    }
+
+    #[test]
+    fn flags_ge_loop_decrement() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(mut x: u32) {\n    while x >= 0 {\n        x -= 1;\n    }\n}\n";
+        assert_eq!(findings(&linter, source).len(), 1, "`while x >= 0` is not a sound unsigned bound");
+    }
+
+    #[test]
+    fn skips_same_expr_nonempty_decrement() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(mut x: u32) {\n    if x == 0 {\n        return;\n    }\n    x -= 1;\n}\n";
+        assert!(findings(&linter, source).is_empty(), "guard on the guarded expr itself");
+    }
+
+    #[test]
+    fn skips_mask_wrapped_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "const M: usize = 15;\nfn f(x: usize) -> usize {\n    (x - 1) & M\n}\n";
+        assert!(findings(&linter, source).is_empty(), "mask-wrapped subtraction");
+    }
+
+    #[test]
+    fn skips_saturating_and_checked_sub() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let sat = "fn f(a: u32, b: u32) -> u32 {\n    a.saturating_sub(b)\n}\n";
+        let checked = "fn f(a: u32, b: u32) -> Option<u32> {\n    a.checked_sub(b)\n}\n";
+        assert!(findings(&linter, sat).is_empty(), "saturating_sub is not a `-`");
+        assert!(findings(&linter, checked).is_empty(), "checked_sub is not a `-`");
+    }
+
+    #[test]
+    fn flags_time_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let time = "fn f(a: std::time::Duration, b: std::time::Duration) -> std::time::Duration {\n    a - b\n}\n";
+        assert_eq!(findings(&linter, time).len(), 1, "Duration - Duration panics on underflow");
+    }
+
+    #[test]
+    fn skips_float_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let float = "fn f(a: f64) -> f64 {\n    a - 1.5\n}\n";
+        assert!(findings(&linter, float).is_empty(), "float arithmetic does not underflow-panic");
+    }
+
+    #[test]
+    fn flags_sibling_field_subtraction() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "struct Q { lengths: [usize; 8], head: usize, off: usize, len: usize }\n\
+            impl Q {\n\
+            fn consume(&self) -> usize {\n\
+            if self.len == 0 {\n\
+            return 0;\n\
+            }\n\
+            self.lengths[self.head] - self.off\n\
+            }\n\
+            }\n";
+        assert_eq!(findings(&linter, source).len(), 1, "sibling-field guard is not a proof");
+    }
+
+    #[test]
+    fn allowlist_parse_requires_reason() {
+        let body = "[[allow]]\npath = \"fx.rs\"\nrule = \"underflow\"\nline = 2\n";
+        assert!(Allowlist::parse(body).is_err(), "missing reason is rejected");
+    }
+
+    #[test]
+    fn allowlist_suppresses_line_match() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f(a: u32, b: u32) -> u32 {\n    a - b\n}\n";
+        assert_eq!(findings(&linter, source).len(), 1, "flagged without allowlist");
+        let allow = Allowlist::parse("[[allow]]\npath = \"fx.rs\"\nrule = \"underflow\"\nline = 2\nreason = \"test site is sized so b never exceeds a\"\n")
+            .expect("parses");
+        let linter = Linter::with_allowlist(PathBuf::from("fx.rs"), allow);
+        assert!(findings(&linter, source).is_empty(), "suppressed by line match");
+    }
+
+    #[test]
+    fn allowlist_suppresses_snippet_match() {
+        let source = "fn f(a: u32, b: u32) -> u32 {\n    a - b\n}\n";
+        let allow = Allowlist::parse("[[allow]]\npath = \"fx.rs\"\nrule = \"underflow\"\nsnippet = \"a - b\"\nreason = \"test site is sized so b never exceeds a\"\n")
+            .expect("parses");
+        let linter = Linter::with_allowlist(PathBuf::from("fx.rs"), allow);
+        assert!(findings(&linter, source).is_empty(), "suppressed by snippet match");
+    }
+
+    #[test]
+    fn allowlist_matches_whitespace_collapsed_snippet() {
+        let source = "fn f() {\n    let n = HEAD_BYTES - b\"GET / HTT\".len();\n}\n";
+        let allow = Allowlist::parse("[[allow]]\npath = \"fx.rs\"\nrule = \"underflow\"\nsnippet = \"HEAD_BYTES - b\\\"GET/HTT\\\".len()\"\nreason = \"buffer cap is >= the constant byte string length\"\n")
+            .expect("parses");
+        let linter = Linter::with_allowlist(PathBuf::from("fx.rs"), allow);
+        assert!(findings(&linter, source).is_empty(), "whitespace-collapsed snippet matches");
     }
 }
 

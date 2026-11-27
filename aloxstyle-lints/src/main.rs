@@ -5,10 +5,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use aloxstyle_lints::{CheckOutcome, Linter};
+use aloxstyle_lints::{Allowlist, CheckOutcome, Linter};
 
 const MAX_WALK_DEPTH: usize = 64;
 const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+const ALLOWLIST_FILENAME: &str = ".aloxstyle-lints.toml";
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
@@ -37,18 +38,99 @@ fn main() -> ExitCode {
     }
 }
 
+/// Parsed command line: the target path and an optional allowlist config file.
+struct Cli {
+    target: PathBuf,
+    allow_config: Option<PathBuf>,
+}
+
 fn run(args: &[OsString]) -> Result<CheckOutcome, String> {
-    let target = parse_target(args)?;
-    let files = collect_sources(&target)?;
+    let cli = parse_args(args)?;
+    let allowlist = load_allowlist(&cli.target, cli.allow_config.as_deref())?;
+    let files = collect_sources(&cli.target)?;
     let mut findings = Vec::new();
     for file in files {
         let source_text = read_source(&file)?;
-        match Linter::new(file).check(&source_text) {
+        match Linter::with_allowlist(file, allowlist.clone()).check(&source_text) {
             CheckOutcome::Findings(found) => findings.extend(found),
             CheckOutcome::Indeterminate => return Ok(CheckOutcome::Indeterminate),
         }
     }
     Ok(CheckOutcome::Findings(findings))
+}
+
+/// Resolves and parses the allowlist config file.
+///
+/// An explicit `--allow-config <file>` is required to exist. Otherwise a
+/// `.aloxstyle-lints.toml` in the analyzed tree root is used when present, and
+/// an empty allowlist is returned when it is absent.
+fn load_allowlist(target: &Path, explicit: Option<&Path>) -> Result<Allowlist, String> {
+    let config_path = explicit.map_or_else(
+        || auto_allow_config_path(target),
+        |path| Some(path.to_path_buf()),
+    );
+    let Some(config_path) = config_path else {
+        return Ok(Allowlist::empty());
+    };
+    let text = match fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(e) => {
+            if explicit.is_some() {
+                return Err(format!(
+                    "read allowlist {}: {e}",
+                    config_path.display()
+                ));
+            }
+            return Ok(Allowlist::empty());
+        }
+    };
+    Allowlist::parse(&text).map_err(|e| format!("{}: {e}", config_path.display()))
+}
+
+/// The nearest `.aloxstyle-lints.toml` at or above the analyzed tree root.
+fn auto_allow_config_path(target: &Path) -> Option<PathBuf> {
+    let mut dir = if target.is_dir() {
+        target.to_path_buf()
+    } else {
+        target.parent()?.to_path_buf()
+    };
+    loop {
+        let candidate = dir.join(ALLOWLIST_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn parse_args(args: &[OsString]) -> Result<Cli, String> {
+    let mut target: Option<PathBuf> = None;
+    let mut allow_config: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let s = arg.to_string_lossy();
+        if s == "--allow-config" {
+            if allow_config.is_some() {
+                return Err(usage().to_string());
+            }
+            let file = args.get(i + 1).ok_or_else(|| usage().to_string())?;
+            allow_config = Some(PathBuf::from(file.as_os_str()));
+            i += 2;
+        } else if s.starts_with("--") {
+            return Err(usage().to_string());
+        } else {
+            if target.is_some() {
+                return Err(usage().to_string());
+            }
+            target = Some(PathBuf::from(arg.as_os_str()));
+            i += 1;
+        }
+    }
+    let target = target.ok_or_else(|| usage().to_string())?;
+    Ok(Cli { target, allow_config })
 }
 
 fn read_source(file: &Path) -> Result<String, String> {
@@ -60,13 +142,6 @@ fn read_source(file: &Path) -> Result<String, String> {
         ));
     }
     fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))
-}
-
-fn parse_target(args: &[OsString]) -> Result<PathBuf, String> {
-    match args {
-        [single] => Ok(PathBuf::from(single.as_os_str())),
-        _ => Err(usage().to_string()),
-    }
 }
 
 fn collect_sources(target: &Path) -> Result<Vec<PathBuf>, String> {
@@ -107,6 +182,6 @@ fn collect_dir_sources(dir: &Path, depth: usize) -> Result<Vec<PathBuf>, String>
 }
 
 const fn usage() -> &'static str {
-    "usage: aloxstyle-lints <path-or-file>
+    "usage: aloxstyle-lints <path-or-file> [--allow-config <file>]
 exit codes: 0 = no findings, 1 = findings, 2 = usage/IO error, 3 = indeterminate (unparseable source)"
 }
