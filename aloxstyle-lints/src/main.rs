@@ -10,6 +10,8 @@ use aloxstyle_lints::{Allowlist, CheckOutcome, Linter};
 const MAX_WALK_DEPTH: usize = 64;
 const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 const ALLOWLIST_FILENAME: &str = ".aloxstyle-lints.toml";
+/// Well-known generated/build/SCM directories the walk never descends into.
+const SKIPPED_DIR_NAMES: &[&str] = &["target", ".git", "node_modules", "vendor", "build", "dist", "out"];
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
@@ -31,8 +33,11 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         }
-        CheckOutcome::Indeterminate => {
-            eprintln!("aloxstyle-lints: source is not parseable; results are indeterminate");
+        CheckOutcome::Indeterminate(file) => {
+            eprintln!(
+                "aloxstyle-lints: {} is not parseable; results are indeterminate",
+                file.display()
+            );
             ExitCode::from(3)
         }
     }
@@ -53,7 +58,7 @@ fn run(args: &[OsString]) -> Result<CheckOutcome, String> {
         let source_text = read_source(&file)?;
         match Linter::with_allowlist(file, allowlist.clone()).check(&source_text) {
             CheckOutcome::Findings(found) => findings.extend(found),
-            CheckOutcome::Indeterminate => return Ok(CheckOutcome::Indeterminate),
+            CheckOutcome::Indeterminate(file) => return Ok(CheckOutcome::Indeterminate(file)),
         }
     }
     Ok(CheckOutcome::Findings(findings))
@@ -152,7 +157,10 @@ fn collect_sources(target: &Path) -> Result<Vec<PathBuf>, String> {
         if target.extension().is_some_and(|e| e == "rs") {
             return Ok(vec![target.to_path_buf()]);
         }
-        return Ok(Vec::new());
+        return Err(format!(
+            "{} is not a Rust source file (.rs); pass a .rs file or a directory",
+            target.display()
+        ));
     }
     Err(format!("no such path: {}", target.display()))
 }
@@ -173,12 +181,21 @@ fn collect_dir_sources(dir: &Path, depth: usize) -> Result<Vec<PathBuf>, String>
             .file_type()
             .map_err(|e| format!("stat {}: {e}", path.display()))?;
         if file_type.is_dir() {
+            if is_skipped_generated_dir(&path) {
+                continue;
+            }
             files.extend(collect_dir_sources(&path, depth + 1)?);
         } else if file_type.is_file() && path.extension().is_some_and(|e| e == "rs") {
             files.push(path);
         }
     }
     Ok(files)
+}
+
+fn is_skipped_generated_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| SKIPPED_DIR_NAMES.contains(&name))
 }
 
 const fn usage() -> &'static str {

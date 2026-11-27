@@ -78,8 +78,10 @@ impl std::fmt::Display for Finding {
 pub enum CheckOutcome {
     /// The source parsed and every rule ran; these are the findings.
     Findings(Vec<Finding>),
-    /// The source could not be parsed, so no rule result is trustworthy.
-    Indeterminate,
+    /// The source could not be parsed, so no rule result is trustworthy. The
+    /// failing file is carried so the caller can name it: a fail-closed gate is
+    /// only actionable when the operator can find the offending file.
+    Indeterminate(PathBuf),
 }
 
 /// A single source-level lint rule.
@@ -119,7 +121,7 @@ impl Linter {
     #[must_use]
     pub fn check(&self, source: &str) -> CheckOutcome {
         let Ok(ast) = syn::parse_file(source) else {
-            return CheckOutcome::Indeterminate;
+            return CheckOutcome::Indeterminate(self.path.clone());
         };
         let mut findings = Vec::new();
         for rule in rules() {
@@ -357,8 +359,13 @@ impl LineMap {
     }
 
     fn byte_offset(&self, source: &str, line: usize, column: usize) -> usize {
-        let line_start = self.line_starts[line - 1];
-        let line_end = self.line_starts.get(line).copied().unwrap_or(source.len());
+        let Some(line_index) = line.checked_sub(1) else {
+            return source.len();
+        };
+        let Some(&line_start) = self.line_starts.get(line_index) else {
+            return source.len();
+        };
+        let line_end = self.line_starts.get(line_index + 1).copied().unwrap_or(source.len());
         let line_text = &source[line_start..line_end];
         line_text
             .char_indices()
@@ -474,7 +481,7 @@ fn unsafe_finding(path: &Path, source: &str, offset: usize, kind: &str) -> Findi
         rule_id: RuleId::UnsafeNeedsSafetyMarker,
         path: path.to_path_buf(),
         line: byte_line(source, offset),
-        column: byte_column(source, offset),
+        column: char_column(source, offset),
         message: format!("unsafe {kind} is not preceded by a // SAFETY: marker"),
     }
 }
@@ -640,19 +647,23 @@ fn parse_config_kv(line: &str) -> Option<(String, String)> {
 }
 
 /// The rule that flags integer subtractions and decrements whose subtrahend may
-/// exceed the minuend, unless the site is constant, a time/float operation, a
+/// exceed the minuend, unless the site is constant, a float-literal operation, a
 /// guarded or counter decrement, or allowlisted.
 ///
 /// Discovery walks the parsed [`syn::File`] for `Expr::Binary` with `BinOp::Sub`
 /// (`a - b`) and `BinOp::SubAssign` (`a -= b`). A site is
 /// skipped when both operands are constant-foldable (a literal or a
 /// `SCREAMING_SNAKE` const path / `.len()` on a const), when either operand is a
-/// float or a time type (`Instant`/`Duration`/`SystemTime`), when it is a
-/// length-counter decrement by one, when it is guarded by a `while x > 0` loop,
-/// an immediately-preceding `if subtrahend >= minuend { return }`/`assert!`, an
-/// empty-queue `if length == 0 { return }`, or when the result wraps under a
-/// `& MASK`. Otherwise it is flagged: conservative, so the author hardens or
-/// allowlists.
+/// float literal, when it is a length-counter decrement by one, when it is
+/// guarded by a `while x > 0` loop, an immediately-preceding
+/// `if subtrahend >= minuend { return }`/`assert!`, an empty-queue
+/// `if length == 0 { return }`, or when the result wraps under a `& MASK`.
+/// Otherwise it is flagged: conservative, so the author hardens or allowlists.
+///
+/// Time-type subtractions (`Duration - Duration`, `Instant - Instant`) are NOT
+/// skipped: their `Sub` impls panic on underflow, so they are flagged like any
+/// other risky subtraction. Only float literals are exempt, because float
+/// arithmetic is saturating rather than panicking.
 pub struct Underflow;
 
 impl Rule for Underflow {
@@ -810,7 +821,7 @@ impl<'a> UnderflowVisitor<'a> {
             rule_id: RuleId::Underflow,
             path: self.path.to_path_buf(),
             line: byte_line(self.source, offset),
-            column: byte_column(self.source, offset),
+            column: char_column(self.source, offset),
             message,
         });
     }
@@ -973,7 +984,7 @@ fn plain_comment_finding(path: &Path, source: &str, start: usize, kind: &str) ->
         rule_id: RuleId::NoNonSafetyComment,
         path: path.to_path_buf(),
         line: byte_line(source, start),
-        column: byte_column(source, start),
+        column: char_column(source, start),
         message: format!("plain {kind} comment is not allowed"),
     }
 }
@@ -982,11 +993,14 @@ fn byte_line(source: &str, byte_offset: usize) -> usize {
     source.as_bytes()[..byte_offset].split(|&b| b == b'\n').count()
 }
 
-fn byte_column(source: &str, byte_offset: usize) -> usize {
+fn char_column(source: &str, byte_offset: usize) -> usize {
     source.as_bytes()[..byte_offset]
         .iter()
         .rposition(|&b| b == b'\n')
-        .map_or(byte_offset + 1, |i| byte_offset - i)
+        .map_or_else(
+            || source[..byte_offset].chars().count() + 1,
+            |i| source[i + 1..byte_offset].chars().count() + 1,
+        )
 }
 
 #[cfg(test)]
@@ -997,7 +1011,7 @@ mod tests {
     fn findings(linter: &Linter, source: &str) -> Vec<Finding> {
         match linter.check(source) {
             CheckOutcome::Findings(findings) => findings,
-            CheckOutcome::Indeterminate => {
+            CheckOutcome::Indeterminate(_) => {
                 unreachable!("fixture unexpectedly unparseable: {source:?}")
             }
         }
@@ -1239,14 +1253,34 @@ mod tests {
     fn check_is_indeterminate_on_unparseable_source() {
         let linter = Linter::new(PathBuf::from("fx.rs"));
         let outcome = linter.check("fn broken( {\n");
-        assert_eq!(outcome, CheckOutcome::Indeterminate, "unparseable source");
+        assert!(
+            matches!(outcome, CheckOutcome::Indeterminate(ref p) if p == &PathBuf::from("fx.rs")),
+            "unparseable source is indeterminate and names the file"
+        );
     }
 
     #[test]
-    fn byte_position_helpers_are_one_based() {
+    fn position_helpers_are_one_based() {
         let source = "ab\ncd// comment\n";
         assert_eq!(super::byte_line(source, 5), 2, "second line");
-        assert_eq!(super::byte_column(source, 5), 3, "third column");
+        assert_eq!(super::char_column(source, 5), 3, "third character column");
+    }
+
+    #[test]
+    fn char_column_counts_characters_not_bytes() {
+        let source = "é  - 1\n";
+        assert_eq!(super::char_column(source, 4), 4, "char column of `-`");
+        assert_eq!(super::byte_line(source, 4), 1, "still on line 1");
+    }
+
+    #[test]
+    fn underflow_finding_line_and_column_handle_crlf() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f() {\r\n    a - b\r\n}\r\n";
+        let findings = findings(&linter, source);
+        assert_eq!(findings.len(), 1, "one unbounded subtraction");
+        assert_eq!(findings[0].line, 2, "CRLF line number is not off by one");
+        assert_eq!(findings[0].column, 5, "CRLF column counts the four leading spaces");
     }
 
     #[test]
@@ -1468,6 +1502,29 @@ mod tests {
             .expect("parses");
         let linter = Linter::with_allowlist(PathBuf::from("fx.rs"), allow);
         assert!(findings(&linter, source).is_empty(), "whitespace-collapsed snippet matches");
+    }
+
+    #[test]
+    fn byte_offset_guard_handles_zero_line() {
+        let source = "ab\ncd\n";
+        let map = super::LineMap::new(source);
+        assert_eq!(
+            map.byte_offset(source, 0, 0),
+            source.len(),
+            "a 0 line (synthetic span) must not panic; falls back to source.len()"
+        );
+    }
+
+    #[test]
+    fn plain_comment_column_is_char_column() {
+        let linter = Linter::new(PathBuf::from("fx.rs"));
+        let source = "fn f() { let s: &str = \"é\"; /* plain */ }\n";
+        let findings = findings(&linter, source);
+        assert_eq!(findings.len(), 1, "one plain block comment");
+        assert_eq!(
+            findings[0].column, 29,
+            "comment column is the char column (é is one char), not the byte column"
+        );
     }
 }
 

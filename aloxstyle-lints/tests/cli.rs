@@ -221,6 +221,10 @@ fn cli_unparseable_source_exits_three() -> Result<(), Box<dyn std::error::Error>
         stderr.contains("indeterminate"),
         "expected indeterminate on stderr, got {stderr}"
     );
+    assert!(
+        stderr.contains("fx.rs"),
+        "expected the offending file name on stderr, got {stderr}"
+    );
     Ok(())
 }
 
@@ -293,5 +297,50 @@ fn cli_allow_config_missing_file_exits_two() -> Result<(), Box<dyn std::error::E
         .arg(&missing)
         .output()?;
     assert_eq!(output.status.code(), Some(2), "expected exit 2, got {output:?}");
+    Ok(())
+}
+
+#[test]
+fn cli_non_rs_direct_file_exits_two() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("note.txt", "not a rust source\n")?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a non-.rs direct-file target is a scope error, got {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("not a Rust source"),
+        "expected a clear not-a-rust message on stderr, got {stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_dir_walk_skips_generated_dirs() -> Result<(), Box<dyn std::error::Error>> {
+    static DIR_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let dir = env::temp_dir().join(format!(
+        "aloxstyle-lints-walk-{}-{}",
+        std::process::id(),
+        DIR_COUNT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(dir.join("target"))?;
+    fs::write(dir.join("main.rs"), "pub fn main() {}\n")?;
+    fs::write(dir.join("target").join("out.rs"), "// generated\npub fn out() {}\n")?;
+    let output = Command::new(bin_path()).arg(&dir).output()?;
+    assert!(
+        output.status.success(),
+        "walk must skip generated dirs, got {output:?}"
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.is_empty(), "expected no findings, got {stdout}");
+    let out_file = dir.join("target").join("out.rs");
+    let direct = Command::new(bin_path()).arg(&out_file).output()?;
+    assert_eq!(
+        direct.status.code(),
+        Some(1),
+        "direct target of a generated file still flags it"
+    );
     Ok(())
 }

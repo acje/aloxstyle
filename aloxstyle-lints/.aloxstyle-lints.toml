@@ -7,12 +7,6 @@
 [[allow]]
 path = "src/lib.rs"
 rule = "underflow"
-snippet = "line_starts[line - 1]"
-reason = "1-based span line from proc-macro2 (Span.line >= 1); line_starts[0] is always the source origin"
-
-[[allow]]
-path = "src/lib.rs"
-rule = "underflow"
 snippet = "tokens[i - 1]"
 reason = "guarded by the preceding `i > 0` term of the same `&&` condition; i - 1 only read when i > 0"
 
@@ -39,9 +33,3 @@ path = "src/lib.rs"
 rule = "underflow"
 snippet = "idx -= 2"
 reason = "inside `while idx >= 2`, idx stays >= 2 so idx - 2 never underflows"
-
-[[allow]]
-path = "src/lib.rs"
-rule = "underflow"
-snippet = "byte_offset - i"
-reason = "rposition of the last newline is strictly before byte_offset, so byte_offset > i"
