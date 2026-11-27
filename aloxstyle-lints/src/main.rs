@@ -5,39 +5,50 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use aloxstyle_lints::{Finding, Linter};
+use aloxstyle_lints::{CheckOutcome, Linter};
 
 const MAX_WALK_DEPTH: usize = 64;
 const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
-    let findings = match run(&args) {
-        Ok(findings) => findings,
+    let outcome = match run(&args) {
+        Ok(outcome) => outcome,
         Err(message) => {
             eprintln!("aloxstyle-lints: {message}");
             return ExitCode::from(2);
         }
     };
-    for finding in &findings {
-        println!("{finding}");
-    }
-    if findings.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    match outcome {
+        CheckOutcome::Findings(findings) => {
+            for finding in &findings {
+                println!("{finding}");
+            }
+            if findings.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        CheckOutcome::Indeterminate => {
+            eprintln!("aloxstyle-lints: source is not parseable; results are indeterminate");
+            ExitCode::from(3)
+        }
     }
 }
 
-fn run(args: &[OsString]) -> Result<Vec<Finding>, String> {
+fn run(args: &[OsString]) -> Result<CheckOutcome, String> {
     let target = parse_target(args)?;
     let files = collect_sources(&target)?;
     let mut findings = Vec::new();
     for file in files {
         let source_text = read_source(&file)?;
-        findings.extend(Linter::new(file).check(&source_text));
+        match Linter::new(file).check(&source_text) {
+            CheckOutcome::Findings(found) => findings.extend(found),
+            CheckOutcome::Indeterminate => return Ok(CheckOutcome::Indeterminate),
+        }
     }
-    Ok(findings)
+    Ok(CheckOutcome::Findings(findings))
 }
 
 fn read_source(file: &Path) -> Result<String, String> {
@@ -96,5 +107,6 @@ fn collect_dir_sources(dir: &Path, depth: usize) -> Result<Vec<PathBuf>, String>
 }
 
 const fn usage() -> &'static str {
-    "usage: aloxstyle-lints <path-or-file>"
+    "usage: aloxstyle-lints <path-or-file>
+exit codes: 0 = no findings, 1 = findings, 2 = usage/IO error, 3 = indeterminate (unparseable source)"
 }

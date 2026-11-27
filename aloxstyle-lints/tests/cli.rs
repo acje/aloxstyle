@@ -163,3 +163,63 @@ fn cli_oversized_source_exits_two() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+#[test]
+fn cli_bare_unsafe_exits_one() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "pub fn fx() { unsafe {} }\n")?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert_eq!(output.status.code(), Some(1), "expected exit 1, got {output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("unsafe block"),
+        "expected unsafe-block finding, got {stdout}"
+    );
+    assert!(
+        stdout.contains("// SAFETY:"),
+        "message references the marker, got {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_safety_marker_unsafe_exits_zero() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source(
+        "fx.rs",
+        "pub fn fx() {\n// SAFETY: sound\nlet d = unsafe {};\n}\n",
+    )?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert!(output.status.success(), "expected exit 0, got {output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.is_empty(), "expected no findings, got {stdout}");
+    Ok(())
+}
+
+#[test]
+fn cli_unsafe_impl_without_marker_exits_one() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "trait T {}\nstruct S;\nunsafe impl T for S {}\n")?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert_eq!(output.status.code(), Some(1), "expected exit 1, got {output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("unsafe impl"),
+        "expected unsafe-impl finding, got {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_unparseable_source_exits_three() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "fn broken( {\n")?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "unparseable source should exit 3, got {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        stderr.contains("indeterminate"),
+        "expected indeterminate on stderr, got {stderr}"
+    );
+    Ok(())
+}
