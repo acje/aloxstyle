@@ -99,3 +99,67 @@ fn cli_non_utf8_arg_does_not_panic() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+fn write_source(name: &str, content: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    static SRC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let dir = env::temp_dir().join(format!(
+        "aloxstyle-lints-src-{}-{}",
+        std::process::id(),
+        SRC_COUNT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir)?;
+    let file = dir.join(name);
+    fs::write(&file, content)?;
+    Ok(file)
+}
+
+#[test]
+fn cli_flags_plain_line_comment() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source("fx.rs", "// foo\npub fn fx() {}\n")?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert_eq!(output.status.code(), Some(1), "expected exit 1, got {output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains(":1:1:"),
+        "finding line:col on stdout, got {stdout}"
+    );
+    assert!(
+        stdout.contains("plain line comment"),
+        "message on stdout, got {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_does_not_flag_doc_and_safety() -> Result<(), Box<dyn std::error::Error>> {
+    let file = write_source(
+        "fx.rs",
+        "//! inner doc\n/// outer doc\n// SAFETY: sound\npub unsafe fn fx() {}\n",
+    )?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert!(output.status.success(), "expected exit 0, got {output:?}");
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.is_empty(), "expected no findings, got {stdout}");
+    Ok(())
+}
+
+#[test]
+fn cli_oversized_source_exits_two() -> Result<(), Box<dyn std::error::Error>> {
+    static SRC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let dir = env::temp_dir().join(format!(
+        "aloxstyle-lints-big-{}-{}",
+        std::process::id(),
+        SRC_COUNT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir)?;
+    let file = dir.join("big.rs");
+    let big = vec![b' '; (1024 * 1024) + 1];
+    fs::write(&file, &big)?;
+    let output = Command::new(bin_path()).arg(&file).output()?;
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "oversize should exit 2, got {output:?}"
+    );
+    Ok(())
+}

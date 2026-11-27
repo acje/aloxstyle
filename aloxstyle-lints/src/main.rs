@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use aloxstyle_lints::{Finding, Linter};
 
 const MAX_WALK_DEPTH: usize = 64;
+const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
@@ -33,11 +34,21 @@ fn run(args: &[OsString]) -> Result<Vec<Finding>, String> {
     let files = collect_sources(&target)?;
     let mut findings = Vec::new();
     for file in files {
-        let source_text =
-            fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+        let source_text = read_source(&file)?;
         findings.extend(Linter::new(file).check(&source_text));
     }
     Ok(findings)
+}
+
+fn read_source(file: &Path) -> Result<String, String> {
+    let meta = fs::metadata(file).map_err(|e| format!("metadata {}: {e}", file.display()))?;
+    if meta.len() > MAX_SOURCE_BYTES {
+        return Err(format!(
+            "{} exceeds {MAX_SOURCE_BYTES} bytes",
+            file.display()
+        ));
+    }
+    fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))
 }
 
 fn parse_target(args: &[OsString]) -> Result<PathBuf, String> {
